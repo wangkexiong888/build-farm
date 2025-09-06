@@ -8,40 +8,85 @@ on:
         required: false
         default: ''
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Install dependencies
+    - name: Prepare dependencies
       run: |
+        sudo mkdir -p /mnt/workdir
+        sudo chown $USER:$GROUPS /mnt/workdir
         sudo apt update
         sudo apt install -y build-essential flex bison dwarves libssl-dev libelf-dev cpio qemu-utils git
 
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Clone WSL2 Kernel repository
+    - name: 检查服务器配置
+      run: |
+        echo "主机信息："
+        uname -a
+        echo -e "\n"
+        echo "--------------------------CPU信息--------------------------"
+        echo "CPU物理数量:$(cat /proc/cpuinfo| grep "physical id"| sort| uniq| wc -l)"
+        echo -e "CPU核心及版本信息：$(cat /proc/cpuinfo | grep name | cut -f2 -d: | uniq -c) \n"
+        echo "--------------------------内存信息--------------------------"
+        echo "已安装内存详细信息："
+        sudo lshw -short -C memory | grep GiB
+        echo "--------------------------硬盘信息--------------------------"
+        echo -e  "硬盘数量：$(ls /dev/sd* | grep -v [1-9] | wc -l) \n"
+        echo "硬盘详情："
+        df -Th
+
+    - name: Prepare kernel version to build
+      working-directory: /mnt/workdir
       run: |
         git clone https://github.com/microsoft/WSL2-Linux-Kernel.git
-        cd WSL2-Linux-Kernel
-
+        pushd WSL2-Linux-Kernel
         INPUT_TAG="${{ github.event.inputs.tag }}"
-
         if [ -n "${INPUT_TAG}" ] && git tag -l "${INPUT_TAG}" | grep -q "${INPUT_TAG}"; then
-          echo "Using input tag: ${INPUT_TAG}"
-          git checkout "${INPUT_TAG}"
+          echo "Use input tag: ${INPUT_TAG}"
           echo "KERNEL_TAG=${INPUT_TAG}" >> ${GITHUB_ENV}
         else
-          echo "Input tag invalid or empty. Using latest tag instead."
+          echo "Input tag is invalid or empty. Use latest tag instead."
           LATEST_TAG=$(git describe --tags `git rev-list --tags --max-count=1`)
-          git checkout "${LATEST_TAG}"
           echo "KERNEL_TAG=${LATEST_TAG}" >> ${GITHUB_ENV}
         fi
+        popd
 
-    - name: Prepare kernel config and merge additional options
+        mv WSL2-Linux-Kernel WSL2-Linux-Kernel.tmp
+        echo "TIMESTAMP=$(date +%s)" >> ${GITHUB_ENV}
+
+    - name: Restore cached build
+      id: cache-restore
+      uses: actions/cache/restore@v4
+      with:
+        path: /mnt/workdir/WSL2-Linux-Kernel
+        key: kernel-${{ env.KERNEL_TAG }}-${{ env.TIMESTAMP }}
+        restore-keys: |
+          kernel-${{ env.KERNEL_TAG }}
+
+    - name: Check cached repository
+      working-directory: /mnt/workdir
       run: |
+        if [ ! -d WSL2-Linux-Kernel ]; then
+          mv WSL2-Linux-Kernel.tmp WSL2-Linux-Kernel
+          cd WSL2-Linux-Kernel
+          git checkout ${{ env.KERNEL_TAG }}
+        fi
+
+    - name: Prepare kernel config
+      working-directory: /mnt/workdir
+      run: |
+        rm -rf WSL2-Linux-Kernel.tmp
         cd WSL2-Linux-Kernel
+        echo "Build commit"
+        git log -1
+
         cp Microsoft/config-wsl .config
         yes "" | make olddefconfig
 
@@ -51,13 +96,41 @@ jobs:
         echo "Finalizing config..."
         yes "" | make olddefconfig
 
-    - name: Build the kernel
-      working-directory: ./WSL2-Linux-Kernel
+    - name: Build kernel
+      working-directory: /mnt/workdir
       run: |
-        make -j$(nproc)
+        cd WSL2-Linux-Kernel
 
-    - name: Upload built kernel
+        make -j$(nproc)
+        make INSTALL_MOD_PATH="$PWD/modules" modules_install
+        find ./modules -name '*.ko' -exec strip --strip-unneeded {} +
+        sudo ./Microsoft/scripts/gen_modules_vhdx.sh "$PWD/modules" $(make -s kernelrelease) modules.vhdx
+
+        rm -rf zzzTarget
+        mkdir zzzTarget
+        cp arch/x86_64/boot/bzImage zzzTarget
+        mv modules.vhdx zzzTarget
+        rm -rf modules
+
+    - name: Update build cache
+      uses: actions/cache/save@v4
+      with:
+        path: /mnt/workdir/WSL2-Linux-Kernel
+        key: ${{ steps.cache-restore.outputs.cache-primary-key }}
+
+    - name: Upload built cache
       uses: actions/upload-artifact@v4
       with:
         name: wsl-kernel-${{ env.KERNEL_TAG }}
-        path: WSL2-Linux-Kernel/arch/x86_64/boot/bzImage
+        path: /mnt/workdir/WSL2-Linux-Kernel
+
+    - name: Update release
+      uses: ncipollo/release-action@v1
+      with:
+        tag: wsl-kernel-${{ env.KERNEL_TAG }}
+        body: self built kernel for redroid working
+        allowUpdates: true
+        removeArtifacts: true
+        artifacts: /mnt/workdir/WSL2-Linux-Kernel/zzzTarget/*
+        token: ${{ github.token }}
+
